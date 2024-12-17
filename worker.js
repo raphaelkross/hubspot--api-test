@@ -262,6 +262,147 @@ const processContacts = async (domain, hubId, q) => {
   return true;
 };
 
+const processMeetings = async (domain, hubId, q) => {
+  const account = domain.integrations.hubspot.accounts.find(account => account.hubId === hubId);
+  const lastPulledDate = new Date(account.lastPulledDates.meetings);
+  const now = new Date();
+
+  // control variables for pagination.
+  let hasMore = true;
+  const offsetObject = {};
+  const limit = 100;
+
+  while (hasMore) {
+    const lastModifiedDate = offsetObject.lastModifiedDate || lastPulledDate;
+    const lastModifiedDateFilter = generateLastModifiedDateFilter(lastModifiedDate, now);
+    
+    // we search for meetings based on last modified date greater than
+    // last time we pulled data.
+    const searchObject = {
+      filterGroups: [lastModifiedDateFilter],
+      sorts: [{ propertyName: 'hs_lastmodifieddate', direction: 'ASCENDING' }],
+      properties: [
+        'hs_meeting_title',
+        'hs_meeting_body',
+        'hs_meeting_start_time',
+        'hs_meeting_end_time',
+        'hs_meeting_outcome'
+      ],
+      limit,
+      after: offsetObject.after
+    };
+
+    let searchResult = {};
+
+    // Try fetching around 4 times.
+    let tryCount = 0;
+    while (tryCount <= 4) {
+      try {
+        searchResult = await hubspotClient.crm.objects.meetings.searchApi.doSearch(searchObject);
+        break;
+      } catch (err) {
+        tryCount++;
+
+        // Refresh the access token if it expired.
+        if (new Date() > expirationDate) await refreshAccessToken(domain, hubId);
+
+        await new Promise((resolve, reject) => setTimeout(resolve, 5000 * Math.pow(2, tryCount)));
+      }
+    }
+
+    if (!searchResult) throw new Error('Failed to fetch meetings. Aborting.');
+
+    const data = searchResult?.results || [];
+    console.log('fetch meeting batch');
+
+    offsetObject.after = parseInt(searchResult.paging?.next?.after);
+
+    // Get meeting <> contact associations
+    const meetingIds = data.map(meeting => meeting.id);
+    const meetingAssociationsResults = (await (await hubspotClient.apiRequest({
+      method: 'post',
+      path: '/crm/v3/associations/MEETINGS/CONTACTS/batch/read',
+      body: { inputs: meetingIds.map(meetingId => ({ id: meetingId })) }
+    })).json())?.results || [];
+
+    // Create a map of meeting ID to contact IDs
+    const meetingToContactMap = {};
+    meetingAssociationsResults.forEach(result => {
+      if (result.from && result.to && result.to.length > 0) {
+        meetingToContactMap[result.from.id] = result.to.map(contact => contact.id);
+      }
+    });
+
+    // Get contact details for all associated contacts
+    const allContactIds = [...new Set(Object.values(meetingToContactMap).flat())];
+    const contactDetails = {};
+    
+    if (allContactIds.length > 0) {
+      const contactsResponse = await hubspotClient.crm.contacts.batchApi.read({
+        properties: ['email'],
+        inputs: allContactIds.map(id => ({ id }))
+      });
+      
+      contactsResponse.results.forEach(contact => {
+        contactDetails[contact.id] = contact.properties.email;
+      });
+    }
+
+    // Process each meeting
+    for (const meeting of data) {
+      const contactIds = meetingToContactMap[meeting.id] || [];
+      const contactEmails = contactIds
+        .map(id => contactDetails[id])
+        .filter(email => email); // Filter undefined emails out.
+
+      // Skip meetings with no associated contacts.
+      if (contactEmails.length === 0) continue; 
+
+      // If createdAt is greater than last pulled, we treat
+      // this as a Meeting Created, else is a Meeting Updated.
+      const isCreated = !lastPulledDate || (new Date(meeting.createdAt) > lastPulledDate);
+
+      const meetingProperties = {
+        meeting_id: meeting.id,
+        meeting_title: meeting.properties.hs_meeting_title,
+        meeting_start_time: meeting.properties.hs_meeting_start_time,
+        meeting_end_time: meeting.properties.hs_meeting_end_time,
+        meeting_outcome: meeting.properties.hs_meeting_outcome
+      };
+
+      // Create an action for each contact that attended the meeting.
+      contactEmails.forEach(email => {
+        const actionTemplate = {
+          includeInAnalytics: 0,
+          identity: email,
+          meetingProperties: filterNullValuesFromObject(meetingProperties)
+        };
+
+        q.push({
+          actionName: isCreated ? 'Meeting Created' : 'Meeting Updated',
+          actionDate: new Date(isCreated ? meeting.createdAt : meeting.updatedAt),
+          ...actionTemplate
+        });
+      });
+    }
+
+    // If no more records, we break the loop.
+    if (!offsetObject?.after) {
+      hasMore = false;
+      break;
+    } else if (offsetObject?.after >= 9900) {
+      offsetObject.after = 0;
+      offsetObject.lastModifiedDate = new Date(data[data.length - 1].updatedAt).valueOf();
+    }
+  }
+
+  // Update lastPulledDates.meetings with date's now.
+  account.lastPulledDates.meetings = now;
+  await saveDomain(domain);
+
+  return true;
+};
+
 const createQueue = (domain, actions) => queue(async (action, callback) => {
   actions.push(action);
 
@@ -316,6 +457,13 @@ const pullDataFromHubspot = async () => {
       console.log('process companies');
     } catch (err) {
       console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processCompanies', hubId: account.hubId } });
+    }
+
+    try {
+      await processMeetings(domain, account.hubId, q);
+      console.log('process meetings');
+    } catch (err) {
+      console.log(err, { apiKey: domain.apiKey, metadata: { operation: 'processMeetings', hubId: account.hubId } });
     }
 
     try {
